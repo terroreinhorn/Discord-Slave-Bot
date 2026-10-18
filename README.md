@@ -1,27 +1,29 @@
-# 🎵 Discord-Slave-Bot (`v2.2.0`)
+# 🎵 Discord-Slave-Bot (`v2.2.1`)
 
-![Version](https://img.shields.io/badge/version-v2.2.0-5865F2?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-v2.2.1-5865F2?style=for-the-badge)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Discord.py](https://img.shields.io/badge/discord.py-voice-5865F2?style=for-the-badge&logo=discord&logoColor=white)
 ![Vibe Coded](https://img.shields.io/badge/%E2%9C%A8_100%25-Vibe_Coded-FF69B4?style=for-the-badge)
 
 > **✨ Note: This bot is 100% Vibe Coded!**  
-> Every feature, bug fix, anti-403 stream workaround, and UI button in **Discord-Slave-Bot** was built iteratively through pure vibes, live testing, and conversational prompting—designed to run 24/7 on an old Zorin OS Linux laptop.
+> Every feature, bug fix, anti-403 stream workaround, and interactive UI button in **Discord-Slave-Bot** was built iteratively through pure vibes, live testing, and conversational prompting—engineered to run 24/7 on a Zorin OS Linux laptop.
 
-**Discord-Slave-Bot** (`slave`) is a self-hosted, single-file Python Discord music bot engineered for high-bitrate studio audio, zero-gap transitions, and zero chat clutter. It searches **1. YouTube Music → 2. Spotify → 3. YouTube** automatically and formats every track cleanly as **`Composer - Song Title`**.
+**Discord-Slave-Bot** (`slave`) is a self-hosted, single-file Python Discord music bot built for high-bitrate studio audio, zero-gap transitions, and zero chat clutter. It searches **1. YouTube Music → 2. Spotify → 3. YouTube** automatically and formats every track cleanly as **`Composer - Song Title`**.
 
 ---
 
-## ✨ Features (`v2.2.0`)
+## ✨ Features (`v2.2.1`)
 
+* **🔑 Safe `git pull` Token Management (`v2.2.1`):**
+  * Automatically loads your Discord bot token from a git-ignored `token.txt` file (or the `DISCORD_TOKEN` environment variable) so you can run `git pull` to update the bot from GitHub anytime without overwriting your token or exposing it in commits.
 * **🎧 3-Stage Priority Search (`1. YouTube Music → 2. Spotify → 3. YouTube`):**
-  * Prioritizes **YouTube Music's** native InnerTube API for clean studio audio streams, falls back to **Spotify / Music Catalog** metadata, and finally regular **YouTube**.
-  * Strips channel clutter (`- Topic`, `VEVO`, `(Official Video)`) so every track displays as **`Composer - Song Title`** (e.g., `Daft Punk - Revolution 909`).
+  * Queries **YouTube Music's** native InnerTube API first for clean studio audio streams, falls back to **Spotify / Music Catalog** metadata second, and regular **YouTube** third.
+  * Strips channel clutter (`- Topic`, `VEVO`, `(Official Video)`) so every song displays as **`Composer - Song Title`** (e.g., `Daft Punk - Revolution 909`).
   * Includes an interactive **"🔎 Did you mean?"** button picker if a search query is misspelled or ambiguous.
 * **🟢 Zero-Config Spotify Integration:**
   * Paste any Spotify **Track, Playlist, Album, or Artist** link (`open.spotify.com/...` or `spotify.link/...`)—extracts up to 100 tracks in under 0.5 seconds with **no Spotify API keys required**.
 * **🔍 Live Slash-Command Autocomplete:**
-  * Typing a song query into `/play`, `/slave play`, or `/slave playnext` pops up a live dropdown of the top 5 matching tracks from YouTube Music in real time (or suggests your liked/recent tracks before you type).
+  * Typing a song query into `/play`, `/slave play`, or `/slave playnext` pops up a live dropdown of the top 5 matching tracks from YouTube Music in real time (or suggests your liked/recent tracks before you start typing).
 * **⚡ Zero-Gap Next-Track Pre-Resolving:**
   * Quietly pre-resolves the audio stream for track `#1 (Up Next)` in the background while the current track is playing (`⚡`), making song transitions and skips instantaneous.
 * **🛡️ 3-Layer Anti-HTTP 403 Stream Engine + Steady Clock Resync:**
@@ -90,24 +92,25 @@ sudo apt install -y python3 python3-pip python3-venv ffmpeg nodejs libffi-dev li
 
 ### 2. Clone the Repository & Create the Virtual Environment
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/Discord-Slave-Bot.git
-cd Discord-Slave-Bot
+git clone https://github.com/terroreinhorn/Discord-Slave-Bot.git ~/slave-bot
+cd ~/slave-bot
 python3 -m venv venv
-source venv/bin/activate
-pip install -U -r requirements.txt
+~/slave-bot/venv/bin/pip install -U pip
+~/slave-bot/venv/bin/pip install -U -r requirements.txt
 ```
 
-### 3. Configure Your Discord Bot Token
+### 3. Configure Your Discord Bot Token (`token.txt`)
 1. Create a bot in the [Discord Developer Portal](https://discord.com/developers/applications) and enable **Message Content Intent** and **Server Members Intent** under the **Bot** tab.
-2. Open `slave_bot.py` and paste your token on **Line 33** (or set the `DISCORD_TOKEN` environment variable):
-   ```python
-   DISCORD_TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
+2. Save your bot token inside a local `token.txt` file (which is automatically ignored by `.gitignore` so `git pull` and `git push` never touch it):
+   ```bash
+   echo "YOUR_DISCORD_BOT_TOKEN_HERE" > ~/slave-bot/token.txt
+   chmod 600 ~/slave-bot/token.txt
    ```
-   > ⚠️ **Never commit your real `DISCORD_TOKEN` to a public GitHub repository!** Discord automatically scans public commits and revokes exposed tokens within seconds.
+   > ⚠️ **Never commit your real Discord token to a public GitHub repository!** Discord automatically scans public commits and revokes exposed tokens within seconds.
 
 ### 4. Run the Bot
 ```bash
-./venv/bin/python slave_bot.py
+~/slave-bot/venv/bin/python ~/slave-bot/slave_bot.py
 ```
 
-For full 24/7 background `systemd` service setup and laptop lid-close configuration on Zorin OS, see [`hosting_guide.md`](hosting_guide.md).
+For full **24/7 background `systemd` service setup**, **laptop lid-close configuration**, and **1-command GitHub updates** on Zorin OS, see [`hosting_guide.md`](hosting_guide.md).
