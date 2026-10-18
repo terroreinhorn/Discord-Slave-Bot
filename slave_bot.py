@@ -1,7 +1,7 @@
 # =====================================================================
-# SLAVE DISCORD MUSIC BOT — VERSION: v2.2.0
+# SLAVE DISCORD MUSIC BOT — VERSION: v2.2.1
 # =====================================================================
-BOT_VERSION = "v2.2.0"
+BOT_VERSION = "v2.2.1"
 
 import asyncio
 import base64
@@ -28,9 +28,33 @@ from discord.ext import commands
 import yt_dlp
 
 # =====================================================================
-# CONFIGURATION — PASTE YOUR DISCORD BOT TOKEN ON LINE 33 BELOW
+# CONFIGURATION — TOKEN CAN BE PLACED IN token.txt OR ON LINE 33 BELOW
 # =====================================================================
 DISCORD_TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
+
+# Optional file path for keeping your token separate so `git pull` never overwrites it
+TOKEN_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt")
+
+
+def resolve_discord_token() -> str:
+    """
+    Loads the Discord bot token from:
+      1. Environment variable `DISCORD_TOKEN` (if set)
+      2. Local `token.txt` file in the same folder (git-ignored, safe for `git pull` updates!)
+      3. `DISCORD_TOKEN` string on Line 33 above
+    """
+    env_token = os.environ.get("DISCORD_TOKEN", "").strip()
+    if env_token and env_token != "YOUR_DISCORD_BOT_TOKEN_HERE":
+        return env_token
+    if os.path.exists(TOKEN_FILE_PATH):
+        try:
+            with open(TOKEN_FILE_PATH, "r", encoding="utf-8") as f:
+                file_token = f.read().strip().strip('"').strip("'")
+                if file_token and file_token != "YOUR_DISCORD_BOT_TOKEN_HERE":
+                    return file_token
+        except Exception as e:
+            print(f"[TOKEN WARN] Could not read {TOKEN_FILE_PATH}: {e}")
+    return DISCORD_TOKEN.strip()
 
 # Optional Spotify Developer credentials (leave empty "" to use automatic zero-config mode)
 SPOTIFY_CLIENT_ID = ""
@@ -484,7 +508,6 @@ def _search_ytmusic_innertube_sync(query: str, limit: int = 8) -> list[dict]:
 
     if results:
         _AUTOCOMPLETE_CACHE[cache_key] = (now, [dict(r) for r in results])
-        # Also prime exact title lookup so selecting an autocomplete option resolves in 0ms
         for r in results:
             title_key = f"{r['title'].lower()}::6"
             if title_key not in _AUTOCOMPLETE_CACHE:
@@ -1422,7 +1445,6 @@ def _is_pre_resolved_stream_valid(pre: dict | None, resolved_at: float) -> bool:
     """Checks whether a pre-resolved stream dict is still fresh and ready for instant playback."""
     if not isinstance(pre, dict) or not pre.get("stream_url"):
         return False
-    # Signed googlevideo URLs last several hours; treat < 15 minutes as fresh
     if (time.monotonic() - resolved_at) > 900.0:
         return False
     local_file = pre.get("local_file")
@@ -2255,7 +2277,6 @@ class SlaveBot(commands.Bot):
                     next_track["_pre_resolved_at"] = time.monotonic()
                     print(f"[PRE-RESOLVE ⚡] Ready for instant transition: {resolved.get('title')}")
                 elif resolved and resolved.get("local_file"):
-                    # Queue order changed while resolving; clean up temp file
                     _cleanup_track_temp_file(resolved)
             except asyncio.CancelledError:
                 pass
@@ -2379,7 +2400,6 @@ class SlaveBot(commands.Bot):
         except Exception as e:
             print(f"Global cleanup note: {e}")
 
-        # Check for recent interrupted sessions (< 12 hours old) and offer a 1-click restore prompt
         data = _load_persistent_data()
         sessions = data.get("sessions", {})
         now_ts = int(time.time())
@@ -2561,7 +2581,6 @@ class SlaveBot(commands.Bot):
                 await state.text_channel.send("✅ Queue finished! Use `/play` or `/slave play` to add more music.")
             return
 
-        # Check if Next-Track Pre-Resolver already resolved this track!
         pre_stream = next_item.pop("_pre_resolved_stream", None)
         pre_at = next_item.pop("_pre_resolved_at", 0.0)
         if seek_seconds == 0 and _is_pre_resolved_stream_valid(pre_stream, pre_at):
@@ -2631,7 +2650,6 @@ class SlaveBot(commands.Bot):
         state.voice_client.play(source, after=after_playing)
         await self.update_presence_status()
 
-        # Trigger background pre-resolver for the next track in queue
         self.trigger_pre_resolve(guild_id)
 
         if state.text_channel and seek_seconds == 0:
@@ -3443,7 +3461,7 @@ async def slave_nowplaying(interaction: discord.Interaction):
     if not state.current:
         await interaction.response.send_message("📭 Nothing is playing right now.")
         return
-    await state.bot_instance_delete_np(state) if hasattr(state, "bot_instance_delete_np") else await bot.delete_previous_np_card(state)
+    await bot.delete_previous_np_card(state)
     embed = build_now_playing_embed(state)
     view = NowPlayingControlView(bot, interaction.guild_id)
     await interaction.response.send_message(embed=embed, view=view)
@@ -3735,7 +3753,11 @@ async def on_message(message: discord.Message):
 
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN or DISCORD_TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
-        print("ERROR: Please paste your Discord bot token on Line 33 of slave_bot.py!")
+    active_token = resolve_discord_token()
+    if not active_token or active_token == "YOUR_DISCORD_BOT_TOKEN_HERE":
+        print(
+            "ERROR: No Discord token found! Save your token in ~/slave-bot/token.txt "
+            "or paste it on Line 33 of slave_bot.py."
+        )
         sys.exit(1)
-    bot.run(DISCORD_TOKEN)
+    bot.run(active_token)
