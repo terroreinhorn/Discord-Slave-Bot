@@ -1,7 +1,7 @@
 # =====================================================================
-# SLAVE DISCORD MUSIC BOT — VERSION: v2.2.1
+# SLAVE DISCORD MUSIC BOT — VERSION: v2.2.2
 # =====================================================================
-BOT_VERSION = "v2.2.1"
+BOT_VERSION = "v2.2.2"
 
 import asyncio
 import base64
@@ -12,11 +12,13 @@ import html as html_lib
 import io
 import json
 import os
+import queue
 import random
 import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -28,7 +30,7 @@ from discord.ext import commands
 import yt_dlp
 
 # =====================================================================
-# CONFIGURATION — TOKEN CAN BE PLACED IN token.txt OR ON LINE 33 BELOW
+# CONFIGURATION — TOKEN CAN BE PLACED IN token.txt OR ON LINE 35 BELOW
 # =====================================================================
 DISCORD_TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
 
@@ -41,7 +43,7 @@ def resolve_discord_token() -> str:
     Loads the Discord bot token from:
       1. Environment variable `DISCORD_TOKEN` (if set)
       2. Local `token.txt` file in the same folder (git-ignored, safe for `git pull` updates!)
-      3. `DISCORD_TOKEN` string on Line 33 above
+      3. `DISCORD_TOKEN` string on Line 35 above
     """
     env_token = os.environ.get("DISCORD_TOKEN", "").strip()
     if env_token and env_token != "YOUR_DISCORD_BOT_TOKEN_HERE":
@@ -56,6 +58,7 @@ def resolve_discord_token() -> str:
             print(f"[TOKEN WARN] Could not read {TOKEN_FILE_PATH}: {e}")
     return DISCORD_TOKEN.strip()
 
+
 # Optional Spotify Developer credentials (leave empty "" to use automatic zero-config mode)
 SPOTIFY_CLIENT_ID = ""
 SPOTIFY_CLIENT_SECRET = ""
@@ -63,7 +66,7 @@ SPOTIFY_CLIENT_SECRET = ""
 # Persistent JSON file for saved playlists, personal likes, and crash-recovery sessions
 DATA_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slave_data.json")
 
-# Temporary directory for fallback audio caching if a direct stream returns HTTP 403
+# Temporary directory for local audio caching (eliminates mid-song network stuttering & HTTP 403)
 TEMP_CACHE_DIR = os.path.join(tempfile.gettempdir(), "slave_audio_cache")
 os.makedirs(TEMP_CACHE_DIR, exist_ok=True)
 
@@ -100,11 +103,9 @@ YTDL_SEARCH_OPTS = {
     "default_search": "ytsearch",
 }
 
-# Primary stream extraction options:
-# - check_formats="selected" makes yt-dlp test the googlevideo URL for HTTP 403 before returning it
-# - js_runtimes enables node/deno if installed on Zorin OS for 2026 YouTube challenges
+# Primary stream extraction options (used for long mixes >15m or live streams)
 YTDL_STREAM_OPTS = {
-    "format": "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best",
+    "format": "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
@@ -114,7 +115,7 @@ YTDL_STREAM_OPTS = {
     "js_runtimes": {"deno": {}, "node": {}},
 }
 
-# Fallback stream extraction options using alternative YouTube clients if the default client 403s
+# Fallback stream extraction options using alternative YouTube clients
 YTDL_FALLBACK_STREAM_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -1040,9 +1041,7 @@ async def search_tracks_with_suggestions(query: str) -> tuple[list[dict], list[d
       1. YouTube Music
       2. Spotify / Music Catalog
       3. Basic YouTube
-    Returns `(exact_matches, candidate_suggestions)`:
-      - If a confident match is found, `exact_matches` has `[best_track]` and `candidate_suggestions` has alternatives.
-      - If no confident match is found, `exact_matches` is `[]` and `candidate_suggestions` has up to 5 songs it could be.
+    Returns `(exact_matches, candidate_suggestions)`.
     """
     cleaned = query.strip().strip('"').strip("'").strip("“”‘’").strip()
     loop = asyncio.get_running_loop()
@@ -1227,8 +1226,23 @@ async def extract_entries(query_or_url: str) -> tuple[list[dict], list[dict]]:
 
 
 # =====================================================================
-# ANTI-403 AUDIO STREAM RESOLUTION, PRE-RESOLVER & LYRICS
+# ANTI-STUTTER & ANTI-403 LOCAL-FIRST AUDIO ENGINE + PRE-BUFFERING
 # =====================================================================
+def _prune_old_cached_files_sync(max_age_seconds: float = 7200.0) -> None:
+    """Removes any orphaned temporary audio files older than 2 hours so /tmp stays clean."""
+    now = time.time()
+    try:
+        for fname in os.listdir(TEMP_CACHE_DIR):
+            fpath = os.path.join(TEMP_CACHE_DIR, fname)
+            if os.path.isfile(fpath) and (now - os.path.getmtime(fpath)) > max_age_seconds:
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _probe_stream_url_sync(stream_url: str, http_headers: dict | None) -> bool:
     """
     Tests whether `stream_url` is accessible using the exact `http_headers` from yt-dlp.
@@ -1260,26 +1274,25 @@ def _probe_stream_url_sync(stream_url: str, http_headers: dict | None) -> bool:
 
 def _download_audio_to_temp_sync(target_url: str) -> tuple[dict | None, str | None]:
     """
-    Layer 3 Fallback: Uses yt-dlp's internal downloader to save the audio track into
-    /tmp/slave_audio_cache so FFmpeg can play the local file with zero HTTP 403 errors.
+    Downloads the track audio into `/tmp/slave_audio_cache` using 10 MB chunked downloading
+    (bypassing YouTube's 1x real-time HTTP stream throttling and mid-song TCP drops).
+    Playing from local disk/RAM completely eliminates network-induced audio stuttering.
     """
+    _prune_old_cached_files_sync()
     token = f"track_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
     outtmpl = os.path.join(TEMP_CACHE_DIR, f"{token}.%(ext)s")
     dl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best",
+        "format": "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "retries": 5,
         "fragment_retries": 5,
+        "concurrent_fragment_downloads": 4,
+        "http_chunk_size": 10485760,  # 10 MB chunks bypass YouTube CDN slow-stream throttling
         "source_address": "0.0.0.0",
         "js_runtimes": {"deno": {}, "node": {}},
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web_embedded", "ios", "mweb", "tv", "web"],
-            }
-        },
     }
     try:
         with yt_dlp.YoutubeDL(dl_opts) as ydl_dl:
@@ -1291,22 +1304,55 @@ def _download_audio_to_temp_sync(target_url: str) -> tuple[dict | None, str | No
             matches = glob.glob(os.path.join(TEMP_CACHE_DIR, f"{token}.*"))
             for filepath in matches:
                 if not filepath.endswith(".part") and os.path.getsize(filepath) > 0:
-                    print(f"[LOCAL CACHE] Downloaded clean audio file: {filepath}")
+                    print(f"[LOCAL CACHE] Cached clean local audio file: {filepath}")
                     return info, filepath
     except Exception as e:
-        print(f"[LOCAL CACHE ERROR] Download fallback failed for {target_url}: {e}")
+        print(f"[LOCAL CACHE WARN] Primary local download failed, trying fallback clients: {e}")
+
+    dl_opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["web_embedded", "ios", "mweb", "tv", "web"],
+        }
+    }
+    try:
+        with yt_dlp.YoutubeDL(dl_opts) as ydl_dl_fb:
+            info = ydl_dl_fb.extract_info(target_url, download=True)
+            if not info:
+                return None, None
+            if "entries" in info and info["entries"]:
+                info = info["entries"][0]
+            matches = glob.glob(os.path.join(TEMP_CACHE_DIR, f"{token}.*"))
+            for filepath in matches:
+                if not filepath.endswith(".part") and os.path.getsize(filepath) > 0:
+                    print(f"[LOCAL CACHE] Cached clean local audio file (fallback client): {filepath}")
+                    return info, filepath
+    except Exception as e:
+        print(f"[LOCAL CACHE ERROR] Download failed for {target_url}: {e}")
+
     return None, None
 
 
-def _extract_verified_stream_sync(target_url: str) -> tuple[dict | None, str | None, dict, str | None]:
+def _extract_verified_stream_sync(
+    target_url: str,
+    duration_hint: int = 0,
+) -> tuple[dict | None, str | None, dict, str | None]:
     """
-    3-Layer Anti-403 Stream Extractor:
-      1. Extracts stream with `check_formats="selected"` and probes it with yt-dlp's `http_headers`.
-      2. If HTTP 403 occurs, retries with fallback player clients (`web_embedded`, `ios`, `mweb`, `tv`).
-      3. If direct streaming still gets 403, downloads the track to `/tmp/slave_audio_cache` via yt-dlp.
+    Local-First Anti-Stutter & Anti-403 Stream Resolver:
+      1. For regular songs (<= 15 minutes), downloads the 3-4 MB audio file directly to
+         `/tmp/slave_audio_cache` in 10 MB chunks so FFmpeg plays from local disk with zero
+         network jitter, zero CDN throttling, and zero mid-song HTTP 403 drops.
+      2. For long mixes (> 15 minutes) or if local caching fails, falls back to verified
+         direct HTTP streaming with exact headers.
     Returns `(info_dict, playable_url_or_filepath, http_headers, local_temp_filepath)`.
     """
-    for label, extractor in (("primary", ytdl_stream), ("fallback-client", ytdl_fallback_stream)):
+    prefer_local_file = duration_hint <= 900  # Cache all normal tracks up to 15 minutes locally
+
+    if prefer_local_file:
+        info, local_path = _download_audio_to_temp_sync(target_url)
+        if info and local_path:
+            return info, local_path, {}, local_path
+
+    for label, extractor in (("primary-http", ytdl_stream), ("fallback-http", ytdl_fallback_stream)):
         try:
             data = extractor.extract_info(target_url, download=False)
             if data and "entries" in data and data["entries"]:
@@ -1316,25 +1362,26 @@ def _extract_verified_stream_sync(target_url: str) -> tuple[dict | None, str | N
                 headers = dict(data.get("http_headers") or {})
                 if _probe_stream_url_sync(s_url, headers):
                     return data, s_url, headers, None
-                print(f"[ANTI-403] {label} stream URL failed HTTP probe, trying next layer...")
+                print(f"[STREAM RESOLVER] {label} stream URL failed HTTP probe, trying next layer...")
         except Exception as e:
-            print(f"[ANTI-403 WARN] {label} extraction error: {e}")
+            print(f"[STREAM RESOLVER WARN] {label} extraction error: {e}")
 
-    print(f"[ANTI-403] Falling back to local temp audio download for: {target_url}")
-    info, local_path = _download_audio_to_temp_sync(target_url)
-    if info and local_path:
-        return info, local_path, {}, local_path
+    if not prefer_local_file:
+        info, local_path = _download_audio_to_temp_sync(target_url)
+        if info and local_path:
+            return info, local_path, {}, local_path
 
     return None, None, {}, None
 
 
 async def resolve_stream(track_item: dict) -> dict | None:
     """
-    Fetches a verified playable audio stream (or local cached audio file),
+    Fetches a verified playable audio stream (preferring local cached files in /tmp),
     preserving 'Composer - Song Title', duration, thumbnail, and HTTP headers for FFmpeg.
     """
     url = track_item.get("url", "")
     source_label = track_item.get("source", "YouTube")
+    dur_hint = int(track_item.get("duration") or 0)
     loop = asyncio.get_running_loop()
 
     if source_label == "Spotify" or "spotify.com" in url or "apple.com" in url:
@@ -1351,6 +1398,7 @@ async def resolve_stream(track_item: dict) -> dict | None:
                 track_item["video_id"] = ytm_matches[0].get("video_id", "")
             if not track_item.get("duration"):
                 track_item["duration"] = ytm_matches[0].get("duration", 0)
+                dur_hint = int(track_item["duration"] or 0)
             if not track_item.get("thumbnail"):
                 track_item["thumbnail"] = ytm_matches[0].get("thumbnail", "")
 
@@ -1358,7 +1406,7 @@ async def resolve_stream(track_item: dict) -> dict | None:
             target_watch_url = f"ytsearch1:{search_query} Official Audio"
 
         data, stream_url, http_headers, local_file = await loop.run_in_executor(
-            None, lambda: _extract_verified_stream_sync(target_watch_url)
+            None, lambda: _extract_verified_stream_sync(target_watch_url, duration_hint=dur_hint)
         )
         if not data or not stream_url:
             return None
@@ -1385,7 +1433,7 @@ async def resolve_stream(track_item: dict) -> dict | None:
         standard_watch_url = f"https://www.youtube.com/watch?v={vid_candidate}"
 
     data, stream_url, http_headers, local_file = await loop.run_in_executor(
-        None, lambda: _extract_verified_stream_sync(standard_watch_url)
+        None, lambda: _extract_verified_stream_sync(standard_watch_url, duration_hint=dur_hint)
     )
     if not data or not stream_url:
         return None
@@ -1490,10 +1538,12 @@ def _fetch_lyrics_sync(query_or_title: str, artist_hint: str = "", track_hint: s
     return None
 
 
-class SteadyOpusSource(discord.AudioSource):
+class BufferedOpusSource(discord.AudioSource):
     """
-    Wraps FFmpegOpusAudio, prevents the 'slow down then speed up' rubber-band effect,
-    and automatically deletes any temporary cached audio file when playback finishes.
+    Eliminates audio stuttering by decoupling FFmpeg from Discord's 20ms real-time UDP
+    voice thread using a dedicated background producer thread and a 5-second (250-frame)
+    RAM ring buffer. Also keeps discord.py's AudioPlayer clock smoothly aligned so it
+    never bursts delayed UDP packets back-to-back.
     """
 
     def __init__(
@@ -1501,28 +1551,94 @@ class SteadyOpusSource(discord.AudioSource):
         inner: discord.FFmpegOpusAudio,
         voice_client: discord.VoiceClient | None,
         local_file: str | None = None,
+        buffer_frames: int = 250,     # 250 * 20ms = 5.0 full seconds of pre-buffered Opus in RAM
+        prebuffer_frames: int = 18,   # Pre-buffer 360ms before starting playback
     ):
         self.inner = inner
         self.vc = voice_client
         self.local_file = local_file
         self.keep_local_file = False
 
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=buffer_frames)
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._prebuffer_frames = prebuffer_frames
+        self._cleaned_up = False
+
+        self._thread = threading.Thread(
+            target=self._fill_buffer_loop,
+            name="SlaveOpusPrebuffer",
+            daemon=True,
+        )
+        self._thread.start()
+        # Wait briefly for the initial pre-buffer so the very first second never stutters
+        self._ready_event.wait(timeout=0.75)
+
     def is_opus(self) -> bool:
         return True
 
-    def read(self) -> bytes:
-        t0 = time.perf_counter()
-        data = self.inner.read()
-        elapsed = time.perf_counter() - t0
+    def _fill_buffer_loop(self) -> None:
+        frames_read = 0
+        try:
+            while not self._stop_event.is_set():
+                packet = self.inner.read()
+                if not packet:
+                    self._ready_event.set()
+                    while not self._stop_event.is_set():
+                        try:
+                            self._queue.put(b"", timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
+                    break
 
-        if elapsed > 0.045 and self.vc is not None:
+                frames_read += 1
+                if frames_read >= self._prebuffer_frames:
+                    self._ready_event.set()
+
+                while not self._stop_event.is_set():
+                    try:
+                        self._queue.put(packet, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as e:
+            print(f"[BUFFER THREAD WARN] {e}")
+            self._ready_event.set()
+            try:
+                self._queue.put_nowait(b"")
+            except Exception:
+                pass
+
+    def read(self) -> bytes:
+        # Prevent discord.py's AudioPlayer loop from bursting packets with 0ms sleep if the OS
+        # scheduler or Python GIL ever delays the thread by >25ms
+        if self.vc is not None:
             player = getattr(self.vc, "_player", None)
             if player is not None and hasattr(player, "_start") and hasattr(player, "loops"):
-                player._start = time.perf_counter() - (player.loops * 0.02)
-        return data
+                now = time.perf_counter()
+                expected = player._start + (player.loops * 0.02)
+                if (now - expected) > 0.025:
+                    player._start = now - (player.loops * 0.02)
+
+        try:
+            packet = self._queue.get(timeout=0.05)
+            return packet
+        except queue.Empty:
+            if not self._thread.is_alive():
+                return b""
+            # Return a valid 20ms silent Opus frame so a momentary CPU spike never drops the stream
+            return b"\xf8\xff\xfe"
 
     def cleanup(self) -> None:
-        self.inner.cleanup()
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        self._stop_event.set()
+        try:
+            self.inner.cleanup()
+        except Exception:
+            pass
         if not self.keep_local_file and self.local_file and os.path.exists(self.local_file):
             try:
                 os.remove(self.local_file)
@@ -1537,9 +1653,9 @@ def _build_ffmpeg_before_options(
 ) -> str:
     """
     Builds FFmpeg `before_options` including the exact User-Agent and HTTP headers
-    that yt-dlp used when signing the googlevideo.com stream URL (preventing HTTP 403).
+    that yt-dlp used when signing the googlevideo.com stream URL.
     """
-    parts: list[str] = []
+    parts: list[str] = ["-nostdin"]
     if seek_seconds > 0:
         parts.append(f"-ss {int(seek_seconds)}")
 
@@ -1562,7 +1678,7 @@ def _build_ffmpeg_before_options(
 
         parts.append(FFMPEG_HTTP_RECONNECT_OPTS)
     else:
-        parts.append("-nostdin")
+        parts.append("-thread_queue_size 4096")
 
     return " ".join(parts)
 
@@ -1574,28 +1690,33 @@ async def build_audio_source(
     seek_seconds: int = 0,
     http_headers: dict | None = None,
     local_file: str | None = None,
-    normalize_audio: bool = True,
-) -> SteadyOpusSource:
+    normalize_audio: bool = False,
+) -> BufferedOpusSource:
     """
-    Creates a high-stability Opus audio stream with exact yt-dlp headers,
-    optional seeking, and automatic studio loudness normalization (`dynaudnorm`).
+    Creates a pre-buffered, stutter-free Opus audio stream without `from_probe` or
+    `aresample=async=1` jitter.
     """
     before_opts = _build_ffmpeg_before_options(stream_url, http_headers, seek_seconds=seek_seconds)
     filters: list[str] = []
     if normalize_audio:
-        filters.append("dynaudnorm=f=150:g=13:p=0.90:m=10.0")
-    filters.append(f"volume={volume:.2f}")
-    filters.append("aresample=async=1:min_hard_comp=0.100:first_pts=0")
-    filter_chain = ",".join(filters)
+        # Lightweight 5-frame window so dynaudnorm never stalls FFmpeg's stdout pipe
+        filters.append("dynaudnorm=f=75:g=5:p=0.90:m=8.0")
+    if abs(volume - 1.0) > 0.01 or normalize_audio:
+        filters.append(f"volume={volume:.2f}")
 
-    ffmpeg_opts = f'-vn -filter:a "{filter_chain}" -bufsize 8192k'
-    opus_source = await discord.FFmpegOpusAudio.from_probe(
+    if filters:
+        filter_chain = ",".join(filters)
+        ffmpeg_opts = f'-vn -threads 2 -filter:a "{filter_chain}" -bufsize 4096k'
+    else:
+        ffmpeg_opts = "-vn -threads 2 -bufsize 4096k"
+
+    opus_source = discord.FFmpegOpusAudio(
         stream_url,
-        method="fallback",
+        bitrate=128,
         before_options=before_opts,
         options=ffmpeg_opts,
     )
-    return SteadyOpusSource(opus_source, voice_client, local_file=local_file)
+    return BufferedOpusSource(opus_source, voice_client, local_file=local_file)
 
 
 class GuildMusicState:
@@ -1609,7 +1730,7 @@ class GuildMusicState:
         self.text_channel: discord.abc.Messageable | None = None
         self.loop_mode: str = "off"  # "off", "track", or "queue"
         self.autoplay: bool = False
-        self.normalize_audio: bool = True  # Studio loudness normalization ON by default
+        self.normalize_audio: bool = False  # Off by default to avoid filter window buffering on older CPUs
         self.volume: float = 0.8  # Default 80%
         self.started_at: float = 0.0
         self.seek_offset: float = 0.0
@@ -2252,7 +2373,7 @@ class SlaveBot(commands.Bot):
             print(f"[NP CARD WARN] Could not send Now Playing card: {e}")
 
     def trigger_pre_resolve(self, guild_id: int) -> None:
-        """Starts a background task to pre-resolve the stream for #1 Up Next (zero-gap transitions)."""
+        """Starts a background task to pre-resolve/cache the stream for #1 Up Next (zero-gap transitions)."""
         state = self.get_guild_state(guild_id)
         if state.pre_resolve_task and not state.pre_resolve_task.done():
             state.pre_resolve_task.cancel()
@@ -2261,7 +2382,8 @@ class SlaveBot(commands.Bot):
 
         async def _pre_resolve_worker():
             try:
-                await asyncio.sleep(1.5)
+                # Wait 4 seconds after current track starts so initial playback gets 100% of CPU/GIL
+                await asyncio.sleep(4.0)
                 if not state.queue or state.loop_mode == "track":
                     return
                 next_track = state.queue[0]
@@ -2270,7 +2392,7 @@ class SlaveBot(commands.Bot):
                     next_track.get("_pre_resolved_at", 0.0),
                 ):
                     return
-                print(f"[PRE-RESOLVE ⚡] Pre-loading stream for Up Next (#1): {next_track.get('title')}")
+                print(f"[PRE-RESOLVE ⚡] Pre-caching audio for Up Next (#1): {next_track.get('title')}")
                 resolved = await resolve_stream(next_track)
                 if resolved and state.queue and state.queue[0] is next_track:
                     next_track["_pre_resolved_stream"] = resolved
@@ -2333,7 +2455,7 @@ class SlaveBot(commands.Bot):
         state.text_channel = text_channel
         state.loop_mode = sess.get("loop_mode", "off")
         state.autoplay = bool(sess.get("autoplay", False))
-        state.normalize_audio = bool(sess.get("normalize_audio", True))
+        state.normalize_audio = bool(sess.get("normalize_audio", False))
         state.volume = float(sess.get("volume", 0.8))
         state.consecutive_failures = 0
 
@@ -2500,7 +2622,7 @@ class SlaveBot(commands.Bot):
 
     async def play_next(self, guild_id: int, seek_seconds: int = 0):
         """
-        Plays the next song in the queue (using the pre-resolved stream if ready for 0.0s gap),
+        Plays the next song in the queue (using the pre-cached local file if ready for 0.0s gap),
         triggers background pre-resolving for the following track, and updates the single player card.
         """
         state = self.get_guild_state(guild_id)
@@ -2583,8 +2705,10 @@ class SlaveBot(commands.Bot):
 
         pre_stream = next_item.pop("_pre_resolved_stream", None)
         pre_at = next_item.pop("_pre_resolved_at", 0.0)
-        if seek_seconds == 0 and _is_pre_resolved_stream_valid(pre_stream, pre_at):
-            print(f"[ZERO-GAP ⚡] Starting pre-resolved track immediately: {pre_stream.get('title')}")
+        if seek_seconds > 0 and next_item.get("local_file") and os.path.exists(next_item["local_file"]):
+            stream_info = next_item
+        elif seek_seconds == 0 and _is_pre_resolved_stream_valid(pre_stream, pre_at):
+            print(f"[ZERO-GAP ⚡] Starting pre-cached track immediately: {pre_stream.get('title')}")
             stream_info = pre_stream
             if next_item.get("requester"):
                 stream_info["requester"] = next_item["requester"]
@@ -2613,6 +2737,8 @@ class SlaveBot(commands.Bot):
                 local_file=stream_info.get("local_file"),
                 normalize_audio=state.normalize_audio,
             )
+            if state.loop_mode == "track":
+                source.keep_local_file = True
         except Exception as e:
             print(f"[FFMPEG ERROR] {e}")
             state.consecutive_failures += 1
@@ -2985,7 +3111,7 @@ async def slave_seek(interaction: discord.Interaction, timestamp: str):
     await interaction.response.defer()
     state.suppress_after_callback = True
     if state.voice_client.is_playing() or state.voice_client.is_paused():
-        if isinstance(state.voice_client.source, SteadyOpusSource):
+        if isinstance(state.voice_client.source, BufferedOpusSource):
             state.voice_client.source.keep_local_file = True
         state.voice_client.stop()
     await bot.play_next(interaction.guild_id, seek_seconds=target_sec)
@@ -3432,6 +3558,8 @@ async def slave_loop(interaction: discord.Interaction, mode: app_commands.Choice
         await interaction.response.send_message(reason, ephemeral=True)
         return
     state.loop_mode = mode.value
+    if state.voice_client and isinstance(state.voice_client.source, BufferedOpusSource):
+        state.voice_client.source.keep_local_file = (mode.value == "track")
     save_active_session_snapshot(interaction.guild_id, state)
     labels = {"off": "⏹️ Loop disabled.", "track": "🔂 Looping current track.", "queue": "🔁 Looping whole playlist."}
     await interaction.response.send_message(labels[mode.value])
@@ -3683,7 +3811,7 @@ async def on_message(message: discord.Message):
         else:
             sec = parse_duration_str(arg)
             state.suppress_after_callback = True
-            if isinstance(state.voice_client.source, SteadyOpusSource):
+            if isinstance(state.voice_client.source, BufferedOpusSource):
                 state.voice_client.source.keep_local_file = True
             state.voice_client.stop()
             await bot.play_next(message.guild.id, seek_seconds=sec)
@@ -3693,7 +3821,7 @@ async def on_message(message: discord.Message):
             await message.channel.send("❌ Nothing is playing right now.")
         else:
             state.suppress_after_callback = True
-            if isinstance(state.voice_client.source, SteadyOpusSource):
+            if isinstance(state.voice_client.source, BufferedOpusSource):
                 state.voice_client.source.keep_local_file = True
             state.voice_client.stop()
             await bot.play_next(message.guild.id, seek_seconds=0)
@@ -3757,7 +3885,7 @@ if __name__ == "__main__":
     if not active_token or active_token == "YOUR_DISCORD_BOT_TOKEN_HERE":
         print(
             "ERROR: No Discord token found! Save your token in ~/slave-bot/token.txt "
-            "or paste it on Line 33 of slave_bot.py."
+            "or paste it on Line 35 of slave_bot.py."
         )
         sys.exit(1)
     bot.run(active_token)
